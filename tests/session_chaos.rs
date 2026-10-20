@@ -279,6 +279,19 @@ fn chaos_large_packets_severe_loss() {
 }
 
 #[test]
+#[ignore]
+fn chaos_10mb_packet_moderate_loss() {
+    // 10MiB 单条消息约一万个分片，手动运行观察弱网下的组包效果
+    run_reliability_case_with_payload(300, 200, 1, 10 * 1024 * 1024, 0x10AB_CDEF);
+}
+
+#[test]
+#[ignore]
+fn chaos_10mb_packet_severe_loss() {
+    run_reliability_case_with_payload(700, 300, 1, 10 * 1024 * 1024, 0x70AB_CDEF);
+}
+
+#[test]
 fn chaos_blackout_then_recover() {
     let addr_a = free_addr();
     let addr_b = free_addr();

@@ -121,6 +121,38 @@ fn session_ack_with_raw_peer() {
 }
 
 #[test]
+#[ignore]
+fn session_10mb_packet_fragmented_and_merged() {
+    let addr_a = free_addr();
+    let addr_b = free_addr();
+    let session_a = make_session(addr_a, addr_b, leak_runtime(addr_a));
+    let session_b = make_session(addr_b, addr_a, leak_runtime(addr_b));
+
+    // 10MiB 会被拆成约一万个分片，手动运行观察耗时与完整性
+    let data: Vec<u8> = (0..10 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let start = Instant::now();
+    session_a.send(bytes_packet(600, data.clone()));
+
+    let got = wait_recv(&session_b, Duration::from_secs(180));
+    let elapsed = start.elapsed();
+    assert_eq!(got.sequence, 600);
+    let received = payload_bytes(&got);
+    assert_eq!(received.len(), data.len());
+    if let Some(index) = received
+        .iter()
+        .zip(data.iter())
+        .position(|(actual, expected)| actual != expected)
+    {
+        panic!("10MiB 数据在下标 {} 处不一致", index);
+    }
+    println!(
+        "10MiB fragmented transfer elapsed={:?}, throughput={:.2} MiB/s",
+        elapsed,
+        data.len() as f64 / 1024.0 / 1024.0 / elapsed.as_secs_f64()
+    );
+}
+
+#[test]
 fn session_large_packet_fragmented_and_merged() {
     let addr_a = free_addr();
     let addr_b = free_addr();
