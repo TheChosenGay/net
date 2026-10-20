@@ -16,6 +16,9 @@ use std::time::SystemTime;
 pub enum TransportError {
     TransportErrorPacketTooLarge,
     TransportErrorPacketTooSmall,
+    
+    TransportErrorInvalidPayloadType(String),
+    TransportErrorInvalidSequence(String),
 }
 
 
@@ -91,7 +94,8 @@ pub const RECV_WINDOW_SIZE: usize = 4096;
 pub struct DefaultTransportCache {
     mailbox: Arc<Mailbox>,
 
-    wait_ack_packets: HashMap<u64, (ExpireInfo, Packet)>, // 等待ack确认的包
+    wait_ack_packets: HashMap<u128, (ExpireInfo, Packet)>, // 等待ack确认的包
+    wait_fragment_packets: HashMap<u64, Vec<Packet>>, // 按消息 sequence 分桶等待组包的分片
     to_send_acks: Vec<Packet>, // 需要发送到ack包
     recv_packets:  Vec<Packet>, // 接收到的包
     recv_window: SlidingWindow, // 接收去重滑动窗口
@@ -102,6 +106,7 @@ impl DefaultTransportCache {
         Self {
             mailbox,
             wait_ack_packets: HashMap::new(),
+            wait_fragment_packets: HashMap::new(),
             to_send_acks: Vec::new(),
             recv_packets: Vec::new(),
             recv_window: SlidingWindow::new(RECV_WINDOW_SIZE),
@@ -142,9 +147,19 @@ impl ITransportCache for DefaultTransportCache {
         
         // 获取待发送的数据包
         if let Some(packets) = self.mailbox.pop_send_batch(MAX_PACKET_SIZE) {
-            send_packets.extend_from_slice(&packets);
+            let mut seperated_send_packets = Vec::new();
             for packet in packets {
-                self.wait_ack_packets.insert(packet.sequence, (ExpireInfo::new(), packet));
+                match seperate_packet(&packet) {
+                    Ok(packets) => seperated_send_packets.extend_from_slice(&packets),
+                    Err(_) => {
+                        continue;
+                    }
+                }
+            }
+                
+            send_packets.extend_from_slice(&seperated_send_packets);
+            for packet in seperated_send_packets {
+                self.wait_ack_packets.insert(packet.key(), (ExpireInfo::new(), packet));
             }
         }
 
@@ -159,16 +174,45 @@ impl ITransportCache for DefaultTransportCache {
     }
 
     fn on_recv(&mut self, packet: Packet) {
-        if !packet.is_ack() {
-            // 重复包和过旧包同样要回 ACK（对方重传多半是因为上次 ACK 丢失），只是不再向上层投递
-            self.to_send_acks.push(Packet::new_ack(packet.version, packet.sequence));
-            match self.recv_window.insert(packet.sequence) {
-                SlidingWindowInsertResult::New => self.recv_packets.push(packet),
-                SlidingWindowInsertResult::Duplicate | SlidingWindowInsertResult::TooOld => {}
+        if packet.is_ack() {
+            // ACK 携带目标包的 128 位 key，可精确删掉某个分片的待确认记录
+            self.wait_ack_packets.remove(&packet.key());
+            return;
+        }
+
+        // 重复包和过旧包同样要回 ACK（对方重传多半是因为上次 ACK 丢失），只是不再向上层投递
+        self.to_send_acks.push(Packet::new_ack(packet.version, packet.key()));
+        // 滑动窗口去重复
+        match self.recv_window.insert(packet.key()) {
+            SlidingWindowInsertResult::New => {
+                if !packet.is_fragment() {
+                    self.recv_packets.push(packet);
+                    return;
+                }
+
+                // 按消息 sequence 分桶攒分片，收齐后整桶取出组包并清理
+                let sequence = packet.sequence;
+                let chunk_count = packet.chunk_count() as usize;
+                if chunk_count == 0 {
+                    println!("NetRuntimeIoState: on_recv: fragment with zero chunk_count, seq: {}", sequence);
+                    return;
+                }
+
+                let complete = {
+                    let bucket = self.wait_fragment_packets.entry(sequence).or_default();
+                    bucket.push(packet);
+                    bucket.len() == chunk_count
+                };
+                if complete {
+                    if let Some(mut bucket) = self.wait_fragment_packets.remove(&sequence) {
+                        match merge_packets(&mut bucket) {
+                            Ok(packet) => self.recv_packets.push(packet),
+                            Err(e) => println!("NetRuntimeIoState: on_recv: merge_packets error: {:?}", e),
+                        }
+                    }
+                }
             }
-        } else {
-            // 确认ack
-            self.wait_ack_packets.remove(&packet.sequence);
+            SlidingWindowInsertResult::Duplicate | SlidingWindowInsertResult::TooOld => {}
         }
     }
     

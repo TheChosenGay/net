@@ -1,6 +1,6 @@
 use net::runtime::{NetRuntime, NetRuntimeConfig};
 use net::session::{Session, SessionConfig};
-use net::transport::packet::Packet;
+use net::transport::packet::{Packet, PayloadType};
 use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -30,11 +30,16 @@ fn make_session(local: SocketAddr, peer: SocketAddr, runtime: &'static NetRuntim
 fn data_packet(sequence: u64, payload_len: usize) -> Packet {
     let mut payload = vec![(sequence % 251) as u8; payload_len];
     payload[..8].copy_from_slice(&sequence.to_le_bytes());
-    Packet::new(1, sequence, payload).unwrap()
+    Packet::new(1, sequence, PayloadType::PayloadTypeBytes(payload)).unwrap()
 }
 
 fn payload_sequence(packet: &Packet) -> u64 {
-    u64::from_le_bytes(packet.payload[..8].try_into().unwrap())
+    match &packet.payload {
+        PayloadType::PayloadTypeBytes(bytes) => {
+            u64::from_le_bytes(bytes[..8].try_into().unwrap())
+        }
+        other => panic!("期望完整字节包, 实际: {:?}", other),
+    }
 }
 
 // ---------- 弱网代理 ----------
@@ -202,6 +207,16 @@ fn collect(session: &Session, expected: &[u64], timeout: Duration) -> CollectRes
 }
 
 fn run_reliability_case(drop_permille: u64, dup_permille: u64, count: u64, seed: u64) {
+    run_reliability_case_with_payload(drop_permille, dup_permille, count, 64, seed)
+}
+
+fn run_reliability_case_with_payload(
+    drop_permille: u64,
+    dup_permille: u64,
+    count: u64,
+    payload_len: usize,
+    seed: u64,
+) {
     let addr_a = free_addr();
     let addr_b = free_addr();
     let proxy = spawn_chaos_proxy(addr_a, addr_b, drop_permille, dup_permille, seed);
@@ -211,7 +226,7 @@ fn run_reliability_case(drop_permille: u64, dup_permille: u64, count: u64, seed:
     // A -> B
     let seqs_ab: Vec<u64> = (1..=count).collect();
     for &seq in &seqs_ab {
-        session_a.send(data_packet(seq, 64));
+        session_a.send(data_packet(seq, payload_len));
     }
     let result_ab = collect(&session_b, &seqs_ab, Duration::from_secs(30));
     assert_eq!(result_ab.received.len() as u64, count);
@@ -220,7 +235,7 @@ fn run_reliability_case(drop_permille: u64, dup_permille: u64, count: u64, seed:
     // B -> A（序号段错开，避免与上一段混淆）
     let seqs_ba: Vec<u64> = (10_001..=10_000 + count).collect();
     for &seq in &seqs_ba {
-        session_b.send(data_packet(seq, 64));
+        session_b.send(data_packet(seq, payload_len));
     }
     let result_ba = collect(&session_a, &seqs_ba, Duration::from_secs(30));
     assert_eq!(result_ba.received.len() as u64, count);
@@ -250,6 +265,17 @@ fn chaos_moderate_loss_and_duplicates() {
 #[test]
 fn chaos_severe_loss_and_duplicates() {
     run_reliability_case(700, 300, 100, 0x5A5A_9876);
+}
+
+#[test]
+fn chaos_large_packets_moderate_loss() {
+    // 每条 5000 字节的消息会被拆成多个分片，在丢包/重复环境下验证组包交付
+    run_reliability_case_with_payload(300, 200, 5, 5000, 0x1A2B_3C4D);
+}
+
+#[test]
+fn chaos_large_packets_severe_loss() {
+    run_reliability_case_with_payload(700, 300, 3, 5000, 0x4D3C_2B1A);
 }
 
 #[test]

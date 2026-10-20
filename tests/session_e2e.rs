@@ -1,6 +1,6 @@
 use net::runtime::{NetRuntime, NetRuntimeConfig};
 use net::session::{Session, SessionConfig};
-use net::transport::packet::Packet;
+use net::transport::packet::{Packet, PayloadType};
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
@@ -34,6 +34,17 @@ fn wait_recv(session: &Session, timeout: Duration) -> Packet {
     }
 }
 
+fn bytes_packet(sequence: u64, bytes: Vec<u8>) -> Packet {
+    Packet::new(1, sequence, PayloadType::PayloadTypeBytes(bytes)).unwrap()
+}
+
+fn payload_bytes(packet: &Packet) -> Vec<u8> {
+    match &packet.payload {
+        PayloadType::PayloadTypeBytes(bytes) => bytes.clone(),
+        other => panic!("期望完整字节包, 实际: {:?}", other),
+    }
+}
+
 fn recv_raw(socket: &UdpSocket, buf: &mut [u8]) -> Packet {
     let (len, _from) = socket.recv_from(buf).expect("等待裸 UDP 包超时");
     Packet::decode(&buf[..len]).expect("裸 UDP 包解码失败")
@@ -47,19 +58,17 @@ fn session_bidirectional_send_recv() {
     let session_b = make_session(addr_b, addr_a, leak_runtime(addr_b));
 
     // A -> B
-    session_a
-        .send(Packet::new(1, 1001, b"ping".to_vec()).unwrap());
+    session_a.send(bytes_packet(1001, b"ping".to_vec()));
     let got = wait_recv(&session_b, Duration::from_secs(3));
     assert_eq!(got.sequence, 1001);
-    assert_eq!(got.payload, b"ping");
+    assert_eq!(payload_bytes(&got), b"ping");
     assert!(!got.is_ack());
 
     // B -> A
-    session_b
-        .send(Packet::new(1, 2002, b"pong".to_vec()).unwrap());
+    session_b.send(bytes_packet(2002, b"pong".to_vec()));
     let got = wait_recv(&session_a, Duration::from_secs(3));
     assert_eq!(got.sequence, 2002);
-    assert_eq!(got.payload, b"pong");
+    assert_eq!(payload_bytes(&got), b"pong");
     assert!(!got.is_ack());
 }
 
@@ -75,26 +84,26 @@ fn session_ack_with_raw_peer() {
     let mut buf = [0u8; 2048];
 
     // 1) 对端发数据包给 Session，应收到 Session 回的 ACK（seq 一致、is_ack 置位）。
-    let inbound = Packet::new(1, 77, b"hello".to_vec()).unwrap();
+    let inbound = bytes_packet(77, b"hello".to_vec());
     raw.send_to(&inbound.encode(), addr_session).unwrap();
 
     let got = wait_recv(&session, Duration::from_secs(3));
     assert_eq!(got.sequence, 77);
-    assert_eq!(got.payload, b"hello");
+    assert_eq!(payload_bytes(&got), b"hello");
 
     let ack = recv_raw(&raw, &mut buf);
     assert!(ack.is_ack(), "Session 应回 ACK 包，实际收到: {:?}", ack);
     assert_eq!(ack.sequence, 77);
 
     // 2) Session 发数据包，对端回 ACK 后，Session 不应再重传该包。
-    session.send(Packet::new(1, 88, b"ackme".to_vec()).unwrap());
+    session.send(bytes_packet(88, b"ackme".to_vec()));
     let data = recv_raw(&raw, &mut buf);
     assert!(!data.is_ack());
     assert_eq!(data.sequence, 88);
-    assert_eq!(data.payload, b"ackme");
+    assert_eq!(payload_bytes(&data), b"ackme");
 
-    // 回 ACK；先给在途的重复包留一个排空窗口，再观察静默期。
-    raw.send_to(&Packet::new_ack(1, 88).encode(), addr_session)
+    // 回 ACK（携带目标包的 128 位 key）；先给在途的重复包留一个排空窗口，再观察静默期。
+    raw.send_to(&Packet::new_ack(1, data.key()).encode(), addr_session)
         .unwrap();
     std::thread::sleep(Duration::from_millis(150));
     raw.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
@@ -109,4 +118,21 @@ fn session_ack_with_raw_peer() {
             extra
         );
     }
+}
+
+#[test]
+fn session_large_packet_fragmented_and_merged() {
+    let addr_a = free_addr();
+    let addr_b = free_addr();
+    let session_a = make_session(addr_a, addr_b, leak_runtime(addr_a));
+    let session_b = make_session(addr_b, addr_a, leak_runtime(addr_b));
+
+    // 5000 字节必然被拆成多个分片，接收端应组包后完整交付
+    let data: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+    session_a.send(bytes_packet(500, data.clone()));
+
+    let got = wait_recv(&session_b, Duration::from_secs(5));
+    assert_eq!(got.sequence, 500);
+    assert!(!got.is_fragment());
+    assert_eq!(payload_bytes(&got), data);
 }

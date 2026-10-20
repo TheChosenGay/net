@@ -1,7 +1,7 @@
-use net::transport::packet::Packet;
+use net::transport::packet::{Packet, PayloadType};
 
 fn main() {
-    match Packet::new(1, 0, vec![1, 2, 3, 4, 5])  {
+    match Packet::new(1, 0, PayloadType::PayloadTypeBytes(vec![1, 2, 3, 4, 5]))  {
         Ok(p) => println!("{:?}", p),
         Err(e) => println!("error: {:?}", e),
     }
