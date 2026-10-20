@@ -7,6 +7,7 @@ use std::sync::mpsc;
 use super::transport::ITransportCache;
 use std::net::UdpSocket;
 use io_state::*;
+use std::time::Duration;
 
 
 #[derive(Debug, Clone)]
@@ -38,7 +39,8 @@ impl NetRuntime {
     pub fn new(config: NetRuntimeConfig) -> Result<Self, NetRuntimeError> {
         let (tx, rx) = mpsc::channel();
         let socket = UdpSocket::bind(config.local_addr).unwrap();
-        socket.set_nonblocking(true).unwrap();
+        socket.set_nonblocking(false).unwrap();
+        socket.set_read_timeout(Some(Duration::from_millis(5))).unwrap();
         let mut io_state = NetRuntimeIoState::new(rx, socket);
         match thread::Builder::new()
             .name(format!("net runtime io thread for addr: {}", config.local_addr))
