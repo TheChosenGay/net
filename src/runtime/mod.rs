@@ -25,12 +25,14 @@ pub struct NetRuntimeConfig {
 pub enum NetRuntimeCmd {
     NetRuntimeCmdRegisterTransport((SocketAddr, Box<dyn ITransportCache + Send>)),
     NetRuntimeCmdUnregisterTransport(SocketAddr),
+    
+    NetRuntimeCmdStop,
 }
 
 
 pub struct NetRuntime {
     config: NetRuntimeConfig,
-    handler: thread::JoinHandle<()>,
+    handler: Option<thread::JoinHandle<()>>,
     tx: mpsc::Sender<NetRuntimeCmd>,
 }
 
@@ -49,11 +51,21 @@ impl NetRuntime {
         }) {
             Ok(handler) => Ok(Self {
                 config,
-                handler,
+                handler: Some(handler),
                 tx,
             }),
             Err(_) => Err(NetRuntimeError::NetRuntimeErrorThreadCreateFailed),
         }
+        
+    }
+    
+    fn stop_and_join(&mut self) {
+        let Some(handler) = self.handler.take() else {
+            println!("NetRuntime: stop_and_join: handler is None");
+            return;
+        };
+        let _ =  self.tx.send(NetRuntimeCmd::NetRuntimeCmdStop);
+        let _ = handler.join();
         
     }
     
@@ -63,6 +75,17 @@ impl NetRuntime {
     
     pub fn unregister_transport_cache(&self, addr: SocketAddr) { 
        self.tx.send(NetRuntimeCmd::NetRuntimeCmdUnregisterTransport(addr)).unwrap(); 
+    }
+    
+    pub fn shut_down(mut self) {
+        self.stop_and_join();
+    }
+    
+}
+
+impl Drop for NetRuntime {
+    fn drop(&mut self) {
+        self.stop_and_join();
     }
 }
 

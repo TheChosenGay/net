@@ -10,6 +10,7 @@ pub struct NetRuntimeIoState {
     transport_map: HashMap<SocketAddr, Box<dyn ITransportCache + Send>>,
     rx: mpsc::Receiver<NetRuntimeCmd>,
     socket: UdpSocket,
+    stop: bool
 }
 
 impl NetRuntimeIoState {
@@ -18,12 +19,17 @@ impl NetRuntimeIoState {
             transport_map: HashMap::new(),
             rx,
             socket,
+            stop: false
         }
     }
 
     pub fn runtime_io_loop(&mut self) {
         loop {
             self.handle_recv_cmd();
+            if self.stop {
+                println!("NetRuntimeIoState: runtime_io_loop: stop");
+                break;
+            }
 
             // 处理发送数据
             self.send_data();
@@ -92,6 +98,9 @@ impl NetRuntimeIoState {
             }
             NetRuntimeCmd::NetRuntimeCmdUnregisterTransport(addr) => {
                 self.transport_map.remove(&addr);
+            }
+            NetRuntimeCmd::NetRuntimeCmdStop => {
+                self.stop = true;
             }
         }
     }
