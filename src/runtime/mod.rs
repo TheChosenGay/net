@@ -8,8 +8,10 @@ use super::transport::ITransportCache;
 use std::net::UdpSocket;
 use io_state::*;
 use std::time::Duration;
+use std::net::{Ipv4Addr, SocketAddrV4};
 
-
+pub const DEFAULT_SOURCE_ADDR: SocketAddr =
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 0), 0));
 #[derive(Debug, Clone)]
 pub enum NetRuntimeError {
     NetRuntimeErrorInvalidCmd,

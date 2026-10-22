@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::mpsc;
 use crate::transport::ITransportCache;
-use super::{NetRuntimeCmd};
+use super::{NetRuntimeCmd, DEFAULT_SOURCE_ADDR};
 use std::net::UdpSocket;
 use crate::transport::packet::*;
 
@@ -55,9 +55,13 @@ impl NetRuntimeIoState {
                 Ok((len, addr)) =>  {
                     match Packet::decode(&buf[..len]) {
                         Ok(packet) => {
-                            // 未知来源（未注册的对端）直接丢弃，避免 IO 线程被单个坏包打死
+                            // 未知来源（未注册的对端）尝试注册默认来源，避免 IO 线程被单个坏包打死
                             if let Some(transport) = self.transport_map.get_mut(&addr) {
                                 transport.on_recv(packet);
+                            } else {
+                                if let Some(transport) = self.transport_map.get_mut(&DEFAULT_SOURCE_ADDR) {
+                                    transport.on_recv(packet);
+                                }
                             }
                         }
                         Err(e) => {

@@ -35,12 +35,12 @@ fn wait_recv(session: &Session, timeout: Duration) -> Packet {
 }
 
 fn bytes_packet(sequence: u64, bytes: Vec<u8>) -> Packet {
-    Packet::new(1, sequence, PayloadType::PayloadTypeBytes(bytes)).unwrap()
+    Packet::new(1, sequence, PayloadType::Bytes(bytes)).unwrap()
 }
 
 fn payload_bytes(packet: &Packet) -> Vec<u8> {
     match &packet.payload {
-        PayloadType::PayloadTypeBytes(bytes) => bytes.clone(),
+        PayloadType::Bytes(bytes) => bytes.clone(),
         other => panic!("期望完整字节包, 实际: {:?}", other),
     }
 }

@@ -75,6 +75,7 @@ impl ExpireInfo {
 pub trait ITransport {
     fn send(&self, packet: Packet);    
     fn recv(&self) -> Option<Packet>;
+    fn recv_all(&self) -> Option<Vec<Packet>>;
 }
 
 pub trait ITransportCache {
@@ -246,6 +247,10 @@ impl ITransport for DefaultTransport {
     }
     fn recv(&self) -> Option<Packet> {
         self.mailbox.pop_recv()
+    }
+    
+    fn recv_all(&self) -> Option<Vec<Packet>> {
+        self.mailbox.pop_recv_batch(MAX_PACKET_SIZE)
     }
 }
 

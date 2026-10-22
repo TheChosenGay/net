@@ -648,6 +648,7 @@ dependencies = [
 name = "net"
 version = "0.1.0"
 dependencies = [
+ "rand 0.8.8",
  "trpl",
 ]
 

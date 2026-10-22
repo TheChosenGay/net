@@ -1,5 +1,8 @@
 use super::TransportError;
 
+/// 当前线协议版本，写入每个 Packet 的 version 字段；不兼容变更时递增。
+pub const PROTOCOL_VERSION: u8 = 1;
+
 pub const MAX_PACKET_SIZE: usize = 1024;
 pub const PACKET_HEADER_SIZE: usize = 10; // 包头的大小
 
@@ -50,22 +53,22 @@ impl Fragment {
 
 #[derive(Debug, Clone)]
 pub enum PayloadType {
-    PayloadTypeFragment(Fragment),
-    PayloadTypeBytes(Vec<u8>),
+    Fragment(Fragment),
+    Bytes(Vec<u8>),
     /// ACK 确认的目标包 128 位 key（sequence 与 fragment_id 的组合键），使分片也能被逐个确认。
-    PayloadTypeAck(u128)
+    Ack(u128)
 }
 
 impl PayloadType {
     pub fn size(&self) -> usize {
         match self {
-            PayloadType::PayloadTypeFragment(fragment) => {
+            PayloadType::Fragment(fragment) => {
                 fragment.size()
             }
-            PayloadType::PayloadTypeBytes(bytes) => {
+            PayloadType::Bytes(bytes) => {
                 bytes.len()
             }
-            PayloadType::PayloadTypeAck(_) => {
+            PayloadType::Ack(_) => {
                 16
             }
         }
@@ -74,15 +77,15 @@ impl PayloadType {
     pub fn encode(&self) -> Vec<u8> {
         let mut data = Vec::new();
         match self {
-            PayloadType::PayloadTypeFragment(fragment) => {
+            PayloadType::Fragment(fragment) => {
                 data.push(0x01);
                 data.extend_from_slice(&fragment.encode());
             }
-            PayloadType::PayloadTypeBytes(bytes) => {
+            PayloadType::Bytes(bytes) => {
                 data.push(0x02);
                 data.extend_from_slice(bytes);
             }
-            PayloadType::PayloadTypeAck(key) => {
+            PayloadType::Ack(key) => {
                 data.push(0x03);
                 data.extend_from_slice(&key.to_le_bytes());
             }
@@ -96,17 +99,17 @@ impl PayloadType {
         }
         match data[0] {
            0x01 => {
-            Ok(PayloadType::PayloadTypeFragment(Fragment::decode(&data[1..])?))            
+            Ok(PayloadType::Fragment(Fragment::decode(&data[1..])?))            
            } 
            0x02 => {
-            Ok(PayloadType::PayloadTypeBytes(data[1..].to_vec()))
+            Ok(PayloadType::Bytes(data[1..].to_vec()))
            }
            0x03 => {
             if data.len() < PAYLOAD_TYPE_SIZE + 16 {
                 return Err(TransportError::TransportErrorPacketTooSmall);
             }
             let key = u128::from_le_bytes(data[1..17].try_into().unwrap());
-            Ok(PayloadType::PayloadTypeAck(key))
+            Ok(PayloadType::Ack(key))
            }
            _ => Err(TransportError::TransportErrorInvalidPayloadType(format!("invalid payload type: {}", data[0]))),
         }
@@ -124,9 +127,9 @@ pub struct Packet {
 impl Packet {
     pub fn new(version: u8, sequence: u64, payload: PayloadType) -> Result<Self, TransportError> {
         let is_ack_or_fragment = match payload {
-            PayloadType::PayloadTypeFragment(_) => 0x02,
-            PayloadType::PayloadTypeBytes(_) => 0x00,
-            PayloadType::PayloadTypeAck(_) => 0x01,
+            PayloadType::Fragment(_) => 0x02,
+            PayloadType::Bytes(_) => 0x00,
+            PayloadType::Ack(_) => 0x01,
         };
         Ok(Self {version, is_ack_or_fragment, sequence, payload})
     }
@@ -135,11 +138,11 @@ impl Packet {
     /// ACK 包返回它所确认的目标包的 key，使每个分片都能被单独确认和删除。
     pub fn key(&self) -> u128 {
         match &self.payload {
-            PayloadType::PayloadTypeAck(ack_key) => *ack_key,
-            PayloadType::PayloadTypeFragment(fragment) => {
+            PayloadType::Ack(ack_key) => *ack_key,
+            PayloadType::Fragment(fragment) => {
                 ((self.sequence as u128) << 64) | fragment.fragment_id as u128
             }
-            PayloadType::PayloadTypeBytes(_) => (self.sequence as u128) << 64,
+            PayloadType::Bytes(_) => (self.sequence as u128) << 64,
         }
     }
     
@@ -148,19 +151,19 @@ impl Packet {
             version,
             is_ack_or_fragment: 0x01,
             sequence: (ack_key >> 64) as u64,
-            payload: PayloadType::PayloadTypeAck(ack_key),
+            payload: PayloadType::Ack(ack_key),
         }
     }
     
     pub fn chunk_count(&self) -> u32 {
         match &self.payload {
-            PayloadType::PayloadTypeFragment(fragment) => {
+            PayloadType::Fragment(fragment) => {
                 fragment.fragment_count
             }
-            PayloadType::PayloadTypeBytes(_) => {
+            PayloadType::Bytes(_) => {
                 1
             }
-            PayloadType::PayloadTypeAck(_) => {
+            PayloadType::Ack(_) => {
                 0
             }
         }
@@ -199,14 +202,14 @@ impl Packet {
 
 pub fn seperate_packet(packet: &Packet) -> Result<Vec<Packet>, TransportError> {
     match &packet.payload {
-        PayloadType::PayloadTypeAck(_) => Ok(vec![packet.clone()]),
-        PayloadType::PayloadTypeFragment(fragment) => {
+        PayloadType::Ack(_) => Ok(vec![packet.clone()]),
+        PayloadType::Fragment(fragment) => {
             if fragment.payload.len() > MAX_FRAGMENT_PAYLOAD_SIZE {
                 return Err(TransportError::TransportErrorInvalidPayloadType(format!("fragment payload too large: {}", fragment.payload.len())));
             }
             Ok(vec![packet.clone()])
         }
-        PayloadType::PayloadTypeBytes(bytes) => {
+        PayloadType::Bytes(bytes) => {
             // 未分片时整包线长 = 包头 + 类型字节 + 载荷，不能超过上限
             if bytes.len() <= MAX_UNFRAGMENTED_PAYLOAD_SIZE {
                 return Ok(vec![packet.clone()]);
@@ -214,7 +217,7 @@ pub fn seperate_packet(packet: &Packet) -> Result<Vec<Packet>, TransportError> {
             let count = bytes.len().div_ceil(MAX_FRAGMENT_PAYLOAD_SIZE);
             let mut packets = Vec::with_capacity(count);
             for (i, chunk) in bytes.chunks(MAX_FRAGMENT_PAYLOAD_SIZE).enumerate() {
-                let payload = PayloadType::PayloadTypeFragment(Fragment::new(i as u32, count as u32, chunk.to_vec()));
+                let payload = PayloadType::Fragment(Fragment::new(i as u32, count as u32, chunk.to_vec()));
                 packets.push(Packet::new(packet.version, packet.sequence, payload)?);
             }
             Ok(packets)
@@ -225,10 +228,10 @@ pub fn seperate_packet(packet: &Packet) -> Result<Vec<Packet>, TransportError> {
 pub fn merge_packets(packets: &mut Vec<Packet>) -> Result<Packet, TransportError> {
     packets.sort_by_key(|packet| { 
         match &packet.payload {
-            PayloadType::PayloadTypeFragment(fragment) => {
+            PayloadType::Fragment(fragment) => {
                 (packet.sequence, fragment.fragment_id)
             }
-            PayloadType::PayloadTypeBytes(_) | PayloadType::PayloadTypeAck(_) => {
+            PayloadType::Bytes(_) | PayloadType::Ack(_) => {
                 (packet.sequence, 0)
             }
         }
@@ -247,10 +250,10 @@ pub fn merge_packets(packets: &mut Vec<Packet>) -> Result<Packet, TransportError
         }
 
         match &packet.payload {
-            PayloadType::PayloadTypeBytes(_) | PayloadType::PayloadTypeAck(_) => {
+            PayloadType::Bytes(_) | PayloadType::Ack(_) => {
                 return Err(TransportError::TransportErrorInvalidPayloadType(format!("the payload to be merged is not fragment: {}", packet.payload.size())));
             }
-            PayloadType::PayloadTypeFragment(fragment) => {
+            PayloadType::Fragment(fragment) => {
                 if fragment.fragment_count as usize != packet_count {
                    return Err(TransportError::TransportErrorInvalidPayloadType(format!("the fragment count of the packet to be merged is not the same: {}", fragment.fragment_count)));
                 }
@@ -261,7 +264,7 @@ pub fn merge_packets(packets: &mut Vec<Packet>) -> Result<Packet, TransportError
             }
         }
     }
-    Ok(Packet::new(version, sequence, PayloadType::PayloadTypeBytes(payload))?)
+    Ok(Packet::new(version, sequence, PayloadType::Bytes(payload))?)
 }
 
 #[cfg(test)]
@@ -273,7 +276,7 @@ mod tests {
         let fragment = Packet::new(
             1,
             10,
-            PayloadType::PayloadTypeFragment(Fragment::new(2, 3, vec![1, 2, 3])),
+            PayloadType::Fragment(Fragment::new(2, 3, vec![1, 2, 3])),
         )
         .unwrap();
         let ack = Packet::new_ack(1, fragment.key());
@@ -289,7 +292,7 @@ mod tests {
     #[test]
     fn seperate_and_merge_roundtrip() {
         let data: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
-        let packet = Packet::new(1, 42, PayloadType::PayloadTypeBytes(data.clone())).unwrap();
+        let packet = Packet::new(1, 42, PayloadType::Bytes(data.clone())).unwrap();
 
         let mut fragments = seperate_packet(&packet).unwrap();
         assert_eq!(fragments.len(), 3);
@@ -303,7 +306,7 @@ mod tests {
         let merged = merge_packets(&mut fragments).unwrap();
         assert_eq!(merged.sequence, 42);
         match merged.payload {
-            PayloadType::PayloadTypeBytes(bytes) => assert_eq!(bytes, data),
+            PayloadType::Bytes(bytes) => assert_eq!(bytes, data),
             other => panic!("合并结果应为完整字节包, 实际: {:?}", other),
         }
     }
@@ -313,7 +316,7 @@ mod tests {
         let packet = Packet::new(
             1,
             7,
-            PayloadType::PayloadTypeBytes(vec![0u8; MAX_UNFRAGMENTED_PAYLOAD_SIZE]),
+            PayloadType::Bytes(vec![0u8; MAX_UNFRAGMENTED_PAYLOAD_SIZE]),
         )
         .unwrap();
         let packets = seperate_packet(&packet).unwrap();
@@ -323,7 +326,7 @@ mod tests {
         let packet = Packet::new(
             1,
             8,
-            PayloadType::PayloadTypeBytes(vec![0u8; MAX_UNFRAGMENTED_PAYLOAD_SIZE + 1]),
+            PayloadType::Bytes(vec![0u8; MAX_UNFRAGMENTED_PAYLOAD_SIZE + 1]),
         )
         .unwrap();
         let packets = seperate_packet(&packet).unwrap();

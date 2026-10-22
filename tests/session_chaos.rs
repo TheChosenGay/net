@@ -30,12 +30,12 @@ fn make_session(local: SocketAddr, peer: SocketAddr, runtime: &'static NetRuntim
 fn data_packet(sequence: u64, payload_len: usize) -> Packet {
     let mut payload = vec![(sequence % 251) as u8; payload_len];
     payload[..8].copy_from_slice(&sequence.to_le_bytes());
-    Packet::new(1, sequence, PayloadType::PayloadTypeBytes(payload)).unwrap()
+    Packet::new(1, sequence, PayloadType::Bytes(payload)).unwrap()
 }
 
 fn payload_sequence(packet: &Packet) -> u64 {
     match &packet.payload {
-        PayloadType::PayloadTypeBytes(bytes) => {
+        PayloadType::Bytes(bytes) => {
             u64::from_le_bytes(bytes[..8].try_into().unwrap())
         }
         other => panic!("期望完整字节包, 实际: {:?}", other),
