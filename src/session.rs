@@ -6,7 +6,7 @@ use crate::connect::*;
 use std::cell::Cell;
 
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SessionState {
     Disconnected, // 未连接
     Connecting, // 正在进行connnect流程
@@ -23,6 +23,117 @@ pub enum SessionPacketError {
 pub enum SessionPacketType {
     Control(ControlPacketType), // control包，
     Data(Vec<u8>), // 上层数据包
+}
+
+
+
+pub struct SessionConnector {
+    state: Cell<SessionState>,
+    prev_challenge_seq: u64,
+}
+
+
+impl SessionConnector {
+    pub fn new(state: SessionState) -> Self {
+        Self {
+            state: Cell::new(state),
+            prev_challenge_seq: 0,
+        }
+    }
+    
+    pub fn state(&self) -> SessionState {
+        self.state.get()
+    }
+    
+    pub fn response_to(&mut self, control: ControlPacketType) -> Result<ControlPacketType, SessionPacketError> {
+        return self.handle_control(control);
+    }
+
+    fn handle_control(&mut self, control: ControlPacketType) -> Result<ControlPacketType, SessionPacketError> {
+        match &control {
+            ControlPacketType::Request(_) => {
+                return self.handle_request();
+            },
+            ControlPacketType::Challenge(change_seq) => {
+                return self.handle_challenge(*change_seq);
+            },
+            ControlPacketType::ChallengeResponse(challenge_seq) => {
+                return self.handle_challenge_response(*challenge_seq);
+            },
+            ControlPacketType::Accept => {
+                return self.handle_accept();
+            },
+            ControlPacketType::Reject => {
+                return self.handle_reject();
+            },
+        }
+    }
+    
+    fn handle_reject(&mut self) -> Result<ControlPacketType, SessionPacketError> {
+        match self.state.get() {
+            SessionState::Connected | SessionState::Disconnected | SessionState::Disconnecting => {
+                return Err(SessionPacketError::InvalidPacketType(format!("Invalid session state: {:?}", self.state.get())));
+            }
+            SessionState::Connecting => {
+                self.state.set(SessionState::Disconnected);
+                return Ok(ControlPacketType::Reject);
+            }
+        }
+    }
+
+    fn handle_accept(&mut self) -> Result<ControlPacketType, SessionPacketError> {
+        match self.state.get() {
+            SessionState::Connected | SessionState::Disconnected | SessionState::Disconnecting => {
+                return Err(SessionPacketError::InvalidPacketType(format!("Invalid session state: {:?}", self.state.get())));
+            }
+            SessionState::Connecting => {
+                self.state.set(SessionState::Connected);
+                return Ok(ControlPacketType::Accept);
+            }
+        }
+    }
+    
+    fn handle_challenge_response(&mut self, challenge_seq: u64) -> Result<ControlPacketType, SessionPacketError> {
+        match self.state.get() {
+            SessionState::Connected | SessionState::Disconnected | SessionState::Disconnecting => {
+                return Err(SessionPacketError::InvalidPacketType(format!("Invalid session state: {:?}", self.state.get())));
+            }
+            SessionState::Connecting => {
+                if challenge_seq != self.prev_challenge_seq {
+                    return Err(SessionPacketError::InvalidPacketType(format!("Invalid challenge sequence: {:?}", challenge_seq)));
+                }
+                self.state.set(SessionState::Connected);
+                return Ok(ControlPacketType::Accept);
+            }
+        }
+    }
+
+    fn handle_request(&mut self) -> Result<ControlPacketType, SessionPacketError> {
+        match self.state.get() {
+            SessionState::Connected | SessionState::Connecting | SessionState::Disconnecting => {
+                return Err(SessionPacketError::InvalidPacketType(format!("Invalid session state: {:?}", self.state.get())));
+            }
+            SessionState::Disconnected => {
+                self.prev_challenge_seq = ControlPacketType::gen_challenge_seq();
+                self.state.set(SessionState::Connecting);
+                return Ok(ControlPacketType::Challenge(self.prev_challenge_seq));
+            }
+        }
+    }
+    
+    // 来了挑战包
+    fn handle_challenge(&mut self, challenge_seq: u64) -> Result<ControlPacketType, SessionPacketError> {
+        match self.state.get() {
+            SessionState::Connected | SessionState::Disconnected | SessionState::Disconnecting => {
+                Err(SessionPacketError::InvalidPacketType(format!("Invalid session state: {:?}", self.state.get())))
+            }
+            SessionState::Connecting => {
+                self.state.set(SessionState::Connecting);
+                Ok(ControlPacketType::ChallengeResponse(challenge_seq))
+            }
+        }
+    }
+    
 }
 
 
@@ -70,9 +181,9 @@ pub struct SessionConfig<'a> {
 pub struct Session<'a> {
     config: SessionConfig<'a>,
     transport: Box<dyn ITransport>,    
-    state: Cell<SessionState>,
     runtime: &'a NetRuntime,
     sequence: u64,
+    connector: SessionConnector,
 }
 
 
@@ -90,9 +201,9 @@ impl<'a> Session<'a> {
         Self {
             config: config.clone(),
             transport: Box::new(transport),
-            state: Cell::new(config.init_session_state),
             runtime,
             sequence: 0,
+            connector: SessionConnector::new(config.init_session_state),
         }
     }
     
@@ -135,7 +246,7 @@ impl<'a> Session<'a> {
                                 return None;
                             }
                             SessionPacketType::Data(_) => {
-                                if self.state.get() == SessionState::Connected {
+                                if self.connector.state() == SessionState::Connected {
                                     return Some(packet);
                                 }
                                 return None;
@@ -155,71 +266,26 @@ impl<'a> Session<'a> {
         }
     }
     
-    pub fn connect_to(&mut self, peer: SocketAddr) {
-        self.state.set(SessionState::Connecting);
-        let sequence = self.next_sequence();
-        self.send(Packet::new(PROTOCOL_VERSION, sequence, PayloadType::Bytes(ControlPacketType::Request(peer).encode())).unwrap());
-    }
-    
-    pub fn disconnect(&mut self) {
-        if self.state.get() != SessionState::Connected {
-            return;            
-        }
-        
-    }
-    
     fn handle_control(&mut self, control: ControlPacketType) {
-        match &control {
-            ControlPacketType::Request(_) => {
-                self.handle_request();
-            },
-            ControlPacketType::Challenge(change_seq) => {
-                self.handle_challenge(*change_seq);
-            },
-            ControlPacketType::ChallengeResponse(_) => {
-                self.state.set(SessionState::Connected);
-            },
-            ControlPacketType::Accept => {
-                self.state.set(SessionState::Connected);
-            },
-            ControlPacketType::Reject => {
-                self.state.set(SessionState::Connected);
-            },
-        }
-    }
-    
-    fn handle_request(&mut self) {
-        match self.state.get() {
-            SessionState::Connected | SessionState::Connecting | SessionState::Disconnecting => {}
-            SessionState::Disconnected => {
-                self.state.set(SessionState::Connecting);
+        match self.connector.response_to(control) {
+            Ok(control) => {
                 let sequence = self.next_sequence();
-                let challenge_seq = ControlPacketType::gen_challenge_seq();
-                self.send(Packet::new(PROTOCOL_VERSION, sequence, PayloadType::Bytes(ControlPacketType::Challenge(challenge_seq).encode())).unwrap());
+                self.send(Packet::new(PROTOCOL_VERSION, sequence, PayloadType::Bytes(control.encode())).unwrap());
+            }
+            Err(e) => {
+                println!("Invalid session packet: {:?}", e);
+                let sequence = self.next_sequence();
+                self.send(Packet::new(PROTOCOL_VERSION, sequence, PayloadType::Bytes(ControlPacketType::Reject.encode())).unwrap());
             }
         }
     }
     
-    // 来了挑战包
-    fn handle_challenge(&mut self, challenge_seq: u64) {
-        match self.state.get() {
-            SessionState::Connected | SessionState::Disconnected | SessionState::Disconnecting => {}
-            SessionState::Connecting => {
-                let sequence = self.next_sequence();
-                self.send(Packet::new(PROTOCOL_VERSION, sequence, PayloadType::Bytes(ControlPacketType::ChallengeResponse(challenge_seq).encode())).unwrap());
-            }
-        }
-    }
-
     
     fn next_sequence(&mut self) -> u64 {
         self.sequence = self.sequence.wrapping_add(1);
         self.sequence
     }
 
-    pub fn state(&self) -> SessionState {
-        self.state.get()
-    }
     
 }
 
