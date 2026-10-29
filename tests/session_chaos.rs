@@ -1,5 +1,5 @@
 use net::runtime::{NetRuntime, NetRuntimeConfig};
-use net::session::{Session, SessionConfig};
+use net::session::{Session, SessionConfig, SessionState};
 use net::transport::packet::{Packet, PayloadType};
 use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, UdpSocket};
@@ -24,6 +24,8 @@ fn make_session(local: SocketAddr, peer: SocketAddr, runtime: &'static NetRuntim
         local_addr: local,
         peer_addr: peer,
         runtime,
+        // 本组测试只测传输层可靠性，绕过握手，会话直接以已连接状态创建
+        init_session_state: SessionState::Connected,
     })
 }
 
@@ -167,7 +169,7 @@ struct CollectResult {
 }
 
 /// 从 session 收齐 expected 里的序号；记录应用层是否收到重复投递。
-fn collect(session: &Session, expected: &[u64], timeout: Duration) -> CollectResult {
+fn collect(session: &mut Session, expected: &[u64], timeout: Duration) -> CollectResult {
     let start = Instant::now();
     let deadline = start + timeout;
     let expected_set: HashSet<u64> = expected.iter().copied().collect();
@@ -220,15 +222,15 @@ fn run_reliability_case_with_payload(
     let addr_a = free_addr();
     let addr_b = free_addr();
     let proxy = spawn_chaos_proxy(addr_a, addr_b, drop_permille, dup_permille, seed);
-    let session_a = make_session(addr_a, proxy.addr_a, leak_runtime(addr_a));
-    let session_b = make_session(addr_b, proxy.addr_b, leak_runtime(addr_b));
+    let mut session_a = make_session(addr_a, proxy.addr_a, leak_runtime(addr_a));
+    let mut session_b = make_session(addr_b, proxy.addr_b, leak_runtime(addr_b));
 
     // A -> B
     let seqs_ab: Vec<u64> = (1..=count).collect();
     for &seq in &seqs_ab {
         session_a.send(data_packet(seq, payload_len));
     }
-    let result_ab = collect(&session_b, &seqs_ab, Duration::from_secs(30));
+    let result_ab = collect(&mut session_b, &seqs_ab, Duration::from_secs(30));
     assert_eq!(result_ab.received.len() as u64, count);
     assert_eq!(result_ab.app_duplicates, 0, "应用层收到了重复投递");
 
@@ -237,7 +239,7 @@ fn run_reliability_case_with_payload(
     for &seq in &seqs_ba {
         session_b.send(data_packet(seq, payload_len));
     }
-    let result_ba = collect(&session_a, &seqs_ba, Duration::from_secs(30));
+    let result_ba = collect(&mut session_a, &seqs_ba, Duration::from_secs(30));
     assert_eq!(result_ba.received.len() as u64, count);
     assert_eq!(result_ba.app_duplicates, 0, "应用层收到了重复投递");
 
@@ -299,7 +301,7 @@ fn chaos_blackout_then_recover() {
     // 从一开始就全丢，模拟持续断网
     proxy.drop_all.store(true, Ordering::Relaxed);
     let session_a = make_session(addr_a, proxy.addr_a, leak_runtime(addr_a));
-    let session_b = make_session(addr_b, proxy.addr_b, leak_runtime(addr_b));
+    let mut session_b = make_session(addr_b, proxy.addr_b, leak_runtime(addr_b));
 
     let seqs: Vec<u64> = (1..=20).collect();
     for &seq in &seqs {
@@ -310,7 +312,7 @@ fn chaos_blackout_then_recover() {
     std::thread::sleep(Duration::from_secs(2));
     proxy.drop_all.store(false, Ordering::Relaxed);
 
-    let result = collect(&session_b, &seqs, Duration::from_secs(8));
+    let result = collect(&mut session_b, &seqs, Duration::from_secs(8));
     assert_eq!(result.received.len(), seqs.len());
     assert_eq!(result.app_duplicates, 0);
     println!(
@@ -322,7 +324,7 @@ fn chaos_blackout_then_recover() {
 
 // ---------- 性能（手动运行: cargo test --release --test session_chaos -- --ignored --nocapture） ----------
 
-fn wait_one(session: &Session, timeout: Duration) -> Packet {
+fn wait_one(session: &mut Session, timeout: Duration) -> Packet {
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(packet) = session.recv() {
@@ -338,17 +340,17 @@ fn wait_one(session: &Session, timeout: Duration) -> Packet {
 fn perf_direct_rtt() {
     let addr_a = free_addr();
     let addr_b = free_addr();
-    let session_a = make_session(addr_a, addr_b, leak_runtime(addr_a));
-    let session_b = make_session(addr_b, addr_a, leak_runtime(addr_b));
+    let mut session_a = make_session(addr_a, addr_b, leak_runtime(addr_a));
+    let mut session_b = make_session(addr_b, addr_a, leak_runtime(addr_b));
 
     const ROUNDS: u64 = 200;
     let mut latencies = Vec::new();
     for i in 0..ROUNDS {
         let start = Instant::now();
         session_a.send(data_packet(30_000 + i, 64));
-        let ping = wait_one(&session_b, Duration::from_secs(5));
+        let ping = wait_one(&mut session_b, Duration::from_secs(5));
         session_b.send(data_packet(40_000 + i, 64));
-        let pong = wait_one(&session_a, Duration::from_secs(5));
+        let pong = wait_one(&mut session_a, Duration::from_secs(5));
         assert_eq!(payload_sequence(&ping), 30_000 + i);
         assert_eq!(payload_sequence(&pong), 40_000 + i);
         latencies.push(start.elapsed());
@@ -371,7 +373,7 @@ fn perf_direct_throughput() {
     let addr_a = free_addr();
     let addr_b = free_addr();
     let session_a = make_session(addr_a, addr_b, leak_runtime(addr_a));
-    let session_b = make_session(addr_b, addr_a, leak_runtime(addr_b));
+    let mut session_b = make_session(addr_b, addr_a, leak_runtime(addr_b));
 
     const TOTAL: u64 = 20_000;
     const CHUNK: u64 = 256;

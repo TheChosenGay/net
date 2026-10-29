@@ -40,10 +40,11 @@ impl NetRuntimeIoState {
     }
     
     pub fn send_data(&mut self) {
-        for (addr, transport) in self.transport_map.iter_mut() {
+        for (_, transport) in self.transport_map.iter_mut() {
             let data = transport.get_send_queue().unwrap_or_default();
-            for data in data.iter() {
-                self.socket.send_to(&data.encode(), addr).unwrap();
+            // 每个包都带着自己的目的地：会话通道固定发给对端，默认通道按包上的地址发
+            for (addr, packet) in data.iter() {
+                self.socket.send_to(&packet.encode(), addr).unwrap();
             }
         }
     }
@@ -55,12 +56,12 @@ impl NetRuntimeIoState {
                 Ok((len, addr)) =>  {
                     match Packet::decode(&buf[..len]) {
                         Ok(packet) => {
-                            // 未知来源（未注册的对端）尝试注册默认来源，避免 IO 线程被单个坏包打死
+                            // 未知来源（未注册的对端）交给默认通道处理，并把来源地址一并带上
                             if let Some(transport) = self.transport_map.get_mut(&addr) {
-                                transport.on_recv(packet);
+                                transport.on_recv(addr, packet);
                             } else {
                                 if let Some(transport) = self.transport_map.get_mut(&DEFAULT_SOURCE_ADDR) {
-                                    transport.on_recv(packet);
+                                    transport.on_recv(addr, packet);
                                 }
                             }
                         }

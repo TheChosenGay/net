@@ -40,9 +40,11 @@ pub struct NetRuntime {
 
 
 impl NetRuntime {
-    pub fn new(config: NetRuntimeConfig) -> Result<Self, NetRuntimeError> {
+    pub fn new(mut config: NetRuntimeConfig) -> Result<Self, NetRuntimeError> {
         let (tx, rx) = mpsc::channel();
         let socket = UdpSocket::bind(config.local_addr).unwrap();
+        // 以实际绑定地址为准：配置里 port 传 0 时，系统分配的端口才是真实本地地址。
+        config.local_addr = socket.local_addr().unwrap_or(config.local_addr);
         socket.set_nonblocking(false).unwrap();
         socket.set_read_timeout(Some(Duration::from_millis(5))).unwrap();
         let mut io_state = NetRuntimeIoState::new(rx, socket);
@@ -61,6 +63,10 @@ impl NetRuntime {
         
     }
     
+    pub fn local_addr(&self) -> SocketAddr {
+        self.config.local_addr
+    }
+
     fn stop_and_join(&mut self) {
         let Some(handler) = self.handler.take() else {
             println!("NetRuntime: stop_and_join: handler is None");

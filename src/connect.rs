@@ -10,6 +10,7 @@ pub enum ControlPacketType {
     ChallengeResponse(u64), // 挑战响应包
     Accept,  // 接收链接
     Reject,  // 拒绝链接
+    Disconnect,  // 断开链接
 }
 
 impl ControlPacketType {
@@ -42,6 +43,9 @@ impl ControlPacketType {
             ControlPacketType::Reject => {
                 buf.push(0x05);
             },
+            ControlPacketType::Disconnect => {
+                buf.push(0x06);
+            },
 
         }
         buf
@@ -63,6 +67,7 @@ impl ControlPacketType {
             0x03 => Ok(Self::ChallengeResponse(u64::from_le_bytes(bytes[1..9].try_into().unwrap()))),
             0x04 => Ok(Self::Accept),
             0x05 => Ok(Self::Reject),
+            0x06 => Ok(Self::Disconnect),
             _ => return Err(ControlPacketError::InvalidPacketType(format!("Invalid connect packet type: {}", bytes[0]))),
         }
     }

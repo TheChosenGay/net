@@ -72,15 +72,16 @@ impl ExpireInfo {
 // 2. 等待ack
 // 3. 收到ack确认
 
+/// Transport 只负责按地址收发包，不假设对端是谁、也不管连接状态：
+/// 发包时由调用方给出目的地，收包时连同来源地址一起返回。
 pub trait ITransport {
-    fn send(&self, packet: Packet);    
-    fn recv(&self) -> Option<Packet>;
-    fn recv_all(&self) -> Option<Vec<Packet>>;
+    fn send_to(&self, addr: SocketAddr, packet: Packet);
+    fn recv_from(&self) -> Option<(SocketAddr, Packet)>;
 }
 
 pub trait ITransportCache {
-    fn get_send_queue(&mut self) -> Option<Vec<Packet>>;
-    fn on_recv(&mut self, packet: Packet);
+    fn get_send_queue(&mut self) -> Option<Vec<(SocketAddr, Packet)>>;
+    fn on_recv(&mut self, source: SocketAddr, packet: Packet);
     fn flush_recv(&mut self);
 }
 
@@ -95,10 +96,10 @@ pub const RECV_WINDOW_SIZE: usize = 4096;
 pub struct DefaultTransportCache {
     mailbox: Arc<Mailbox>,
 
-    wait_ack_packets: HashMap<u128, (ExpireInfo, Packet)>, // 等待ack确认的包
+    wait_ack_packets: HashMap<u128, (ExpireInfo, SocketAddr, Packet)>, // 等待ack确认的包（带目的地）
     wait_fragment_packets: HashMap<u64, Vec<Packet>>, // 按消息 sequence 分桶等待组包的分片
-    to_send_acks: Vec<Packet>, // 需要发送到ack包
-    recv_packets:  Vec<Packet>, // 接收到的包
+    to_send_acks: Vec<(SocketAddr, Packet)>, // 需要发送到ack包（带目的地）
+    recv_packets:  Vec<(SocketAddr, Packet)>, // 接收到的包（带来源地址）
     recv_window: SlidingWindow, // 接收去重滑动窗口
 }
 
@@ -114,11 +115,11 @@ impl DefaultTransportCache {
         }
     }
     
-    pub fn get_expired_unacked_packets(&mut self) -> Option<Vec<Packet>> {
+    pub fn get_expired_unacked_packets(&mut self) -> Option<Vec<(SocketAddr, Packet)>> {
         let mut unacked_packets = Vec::new();
-        self.wait_ack_packets.iter_mut().for_each(|(_, (expire_info, packet))| {
+        self.wait_ack_packets.iter_mut().for_each(|(_, (expire_info, addr, packet))| {
             if expire_info.is_expired() {
-                unacked_packets.push(packet.clone());
+                unacked_packets.push((*addr, packet.clone()));
                 // 本次重传后刷新超时时间，避免到期后每个 IO 循环都重复发同一批包
                 *expire_info = expire_info.next();
             }
@@ -134,7 +135,7 @@ impl DefaultTransportCache {
 }
 
 impl ITransportCache for DefaultTransportCache {
-    fn get_send_queue(&mut self) -> Option<Vec<Packet>> {
+    fn get_send_queue(&mut self) -> Option<Vec<(SocketAddr, Packet)>> {
         // 获取要发送的ack包
         let mut send_packets = Vec::new();
 
@@ -142,25 +143,24 @@ impl ITransportCache for DefaultTransportCache {
         if let Some(packets) = self.get_expired_unacked_packets() {
             send_packets.extend_from_slice(&packets);
         }
-        
+
         // 获取需要发送的ack包
         send_packets.extend_from_slice(&self.to_send_acks);
-        
-        // 获取待发送的数据包
+
+        // 获取待发送的数据包（每个包都带着自己的目的地）
         if let Some(packets) = self.mailbox.pop_send_batch(MAX_PACKET_SIZE) {
-            let mut seperated_send_packets = Vec::new();
-            for packet in packets {
+            for (addr, packet) in packets {
                 match seperate_packet(&packet) {
-                    Ok(packets) => seperated_send_packets.extend_from_slice(&packets),
+                    Ok(seperated) => {
+                        for packet in seperated {
+                            send_packets.push((addr, packet.clone()));
+                            self.wait_ack_packets.insert(packet.key(), (ExpireInfo::new(), addr, packet));
+                        }
+                    }
                     Err(_) => {
                         continue;
                     }
                 }
-            }
-                
-            send_packets.extend_from_slice(&seperated_send_packets);
-            for packet in seperated_send_packets {
-                self.wait_ack_packets.insert(packet.key(), (ExpireInfo::new(), packet));
             }
         }
 
@@ -174,7 +174,7 @@ impl ITransportCache for DefaultTransportCache {
 
     }
 
-    fn on_recv(&mut self, packet: Packet) {
+    fn on_recv(&mut self, source: SocketAddr, packet: Packet) {
         if packet.is_ack() {
             // ACK 携带目标包的 128 位 key，可精确删掉某个分片的待确认记录
             self.wait_ack_packets.remove(&packet.key());
@@ -182,12 +182,12 @@ impl ITransportCache for DefaultTransportCache {
         }
 
         // 重复包和过旧包同样要回 ACK（对方重传多半是因为上次 ACK 丢失），只是不再向上层投递
-        self.to_send_acks.push(Packet::new_ack(packet.version, packet.key()));
+        self.to_send_acks.push((source, Packet::new_ack(packet.version, packet.key())));
         // 滑动窗口去重复
         match self.recv_window.insert(packet.key()) {
             SlidingWindowInsertResult::New => {
                 if !packet.is_fragment() {
-                    self.recv_packets.push(packet);
+                    self.recv_packets.push((source, packet));
                     return;
                 }
 
@@ -207,7 +207,7 @@ impl ITransportCache for DefaultTransportCache {
                 if complete {
                     if let Some(mut bucket) = self.wait_fragment_packets.remove(&sequence) {
                         match merge_packets(&mut bucket) {
-                            Ok(packet) => self.recv_packets.push(packet),
+                            Ok(packet) => self.recv_packets.push((source, packet)),
                             Err(e) => println!("NetRuntimeIoState: on_recv: merge_packets error: {:?}", e),
                         }
                     }
@@ -219,7 +219,7 @@ impl ITransportCache for DefaultTransportCache {
     
     fn flush_recv(&mut self) {
         // 有序返回
-        self.recv_packets.sort_by_key(|packet| packet.sequence);
+        self.recv_packets.sort_by_key(|(_, packet)| packet.sequence);
         self.mailbox.push_recv_batch(self.recv_packets.clone());
         self.recv_packets.clear();
     }
@@ -227,36 +227,31 @@ impl ITransportCache for DefaultTransportCache {
 
 
 pub struct DefaultTransport {
-    peer: SocketAddr,
     mailbox: Arc<Mailbox>,
 }
 
 
 impl DefaultTransport {
-    pub fn new_with(peer: SocketAddr, mailbox: Arc<Mailbox>) -> Self {
+    pub fn new_with(mailbox: Arc<Mailbox>) -> Self {
         Self {
-            peer,
             mailbox,
         }
     }
 }
 
 impl ITransport for DefaultTransport {
-    fn send(&self, packet: Packet) {
-        self.mailbox.push_send(packet);
+    fn send_to(&self, addr: SocketAddr, packet: Packet) {
+        self.mailbox.push_send(addr, packet);
     }
-    fn recv(&self) -> Option<Packet> {
+
+    fn recv_from(&self) -> Option<(SocketAddr, Packet)> {
         self.mailbox.pop_recv()
-    }
-    
-    fn recv_all(&self) -> Option<Vec<Packet>> {
-        self.mailbox.pop_recv_batch(MAX_PACKET_SIZE)
     }
 }
 
-pub fn default_transport_pair(peer: SocketAddr, mail_size: usize) -> (DefaultTransport, DefaultTransportCache) {
+pub fn default_transport_pair(mail_size: usize) -> (DefaultTransport, DefaultTransportCache) {
     let mailbox = Arc::new(Mailbox::new(mail_size));
-    let transport = DefaultTransport::new_with(peer, Arc::clone(&mailbox));
+    let transport = DefaultTransport::new_with(Arc::clone(&mailbox));
     let transport_cache = DefaultTransportCache::new_with_mailbox(Arc::clone(&mailbox));
     (transport, transport_cache)
 }
